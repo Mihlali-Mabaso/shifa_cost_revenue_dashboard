@@ -1,6 +1,5 @@
 """
-Shifa — Cost & Revenue Dashboard
-Professional, clean financial dashboard for the pitch deck
+Shifa — Financial Dashboard (2027)
 """
 
 import streamlit as st
@@ -8,13 +7,11 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-# Page config
 st.set_page_config(
-    page_title="Shifa — Cost & Revenue",
+    page_title="Shifa — Financial Model 2027",
     page_icon="📊",
     layout="wide"
 )
@@ -52,97 +49,75 @@ st.markdown("""
         font-size: 0.8rem;
         color: #6c757d;
     }
-    .positive {
-        color: #28a745;
-    }
-    .negative {
-        color: #dc3545;
-    }
-    .neutral {
-        color: #6c757d;
-    }
 </style>
 """, unsafe_allow_html=True)
 
 # ============================================================================
-# DATA GENERATION
+# DATA
 # ============================================================================
 
 @st.cache_data
 def generate_financial_data():
-    """Generate realistic cost and revenue projections for Year 1"""
+    """Generate realistic monthly financial projections for 2027"""
     
     months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
               'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-    months_idx = np.arange(len(months))
     
-    # Invoices per month (growing from 200 to 3,000)
-    invoices_per_month = np.round(200 + (3000 - 200) / (1 + np.exp(-0.6 * (months_idx - 6)))).astype(int)
-    
-    # Average invoice value: R150,000 - R250,000
-    avg_invoice_value = np.round(150000 + (100000) / (1 + np.exp(-0.4 * (months_idx - 5))), -3)
-    
-    # Total invoice value per month
-    total_value_per_month = invoices_per_month * avg_invoice_value
-    
-    # Transaction fee revenue (1.5-4.5%)
-    fee_revenue_absa = total_value_per_month * 0.015  # 1.5% for Absa customers
-    fee_revenue_nonabsa = total_value_per_month * 0.025  # 2.5% for non-Absa (mix)
-    total_fee_revenue = fee_revenue_absa + fee_revenue_nonabsa
-    
-    # Escrow fee revenue (0.5% of total value)
-    escrow_revenue = total_value_per_month * 0.005
-    
-    # Collections management revenue (0.5% of total value, 10% take-up)
-    collections_revenue = total_value_per_month * 0.005 * 0.10
-    
-    # Total revenue
-    total_revenue = total_fee_revenue + escrow_revenue + collections_revenue
+    # Invoice growth: 50 → 1,000 over 12 months
+    invoices = np.round(50 + (1000 - 50) / (1 + np.exp(-0.6 * (np.arange(12) - 6)))).astype(int)
     
     # Costs
-    # AWS costs: Lambda, API Gateway, DynamoDB, S3, Textract, Bedrock
-    aws_lambda = 2000 + (invoices_per_month * 0.15)  # Base + per invoice
-    aws_textract = invoices_per_month * 0.30  # $0.30 per page
-    aws_bedrock = invoices_per_month * 0.20  # $0.20 per call
-    aws_storage = 500 + (invoices_per_month * 0.01)
-    aws_total = aws_lambda + aws_textract + aws_bedrock + aws_storage
+    aws_lambda = 150  # Base, scales slightly
+    aws_textract = invoices * 0.30
+    aws_bedrock = invoices * 0.20
+    aws_dynamodb = 100
+    aws_s3 = 50
+    aws_api = invoices * 0.01
+    aws_sns = invoices * 0.02
+    aws_total = aws_lambda + aws_textract + aws_bedrock + aws_dynamodb + aws_s3 + aws_api + aws_sns
     
-    # Development costs (amortized)
-    dev_costs = 25000  # Per month, fixed
+    multi_cloud = aws_total * 0.10
+    dev_costs = 120000  # Fixed
+    marketing = 15000 + (invoices * 0.50)  # Variable
+    compliance = 8000  # Fixed
+    total_costs = aws_total + multi_cloud + dev_costs + marketing + compliance
     
-    # Marketing & acquisition
-    marketing = 5000 + (invoices_per_month * 0.50)
+    # Revenue
+    avg_invoice_value = 185000
+    absa_invoices = invoices * 0.40
+    nonabsa_invoices = invoices * 0.60
     
-    # Compliance & admin
-    compliance = 3000  # Per month, fixed
+    fee_revenue_absa = absa_invoices * 0.015 * avg_invoice_value
+    fee_revenue_nonabsa = nonabsa_invoices * 0.045 * avg_invoice_value
+    fee_revenue = fee_revenue_absa + fee_revenue_nonabsa
     
-    # Multi-cloud redundancy (Azure/GCP fallback)
-    multi_cloud = aws_total * 0.10  # 10% premium for redundancy
+    escrow_revenue = invoices * 0.005 * avg_invoice_value
+    collections_revenue = invoices * 0.005 * avg_invoice_value * 0.10
     
-    # Total costs
-    total_costs = aws_total + dev_costs + marketing + compliance + multi_cloud
+    total_revenue = fee_revenue + escrow_revenue + collections_revenue
     
-    # Profit
-    profit = total_revenue - total_costs
-    profit_margin = (profit / total_revenue) * 100
+    # Absa gains
+    absa_share = (fee_revenue * 0.20) + (escrow_revenue * 0.20)
+    new_customers = nonabsa_invoices * 0.60
+    cross_sell_revenue = new_customers * 5000  # R5,000 LTV per customer
     
     return pd.DataFrame({
         'Month': months,
-        'Invoices': invoices_per_month,
-        'Invoice_Value': avg_invoice_value,
-        'Total_Value': total_value_per_month,
-        'Fee_Revenue': total_fee_revenue,
+        'Invoices': invoices,
+        'AWS_Costs': aws_total,
+        'Multi_Cloud': multi_cloud,
+        'Dev_Costs': dev_costs,
+        'Marketing': marketing,
+        'Compliance': compliance,
+        'Total_Costs': total_costs,
+        'Fee_Revenue': fee_revenue,
         'Escrow_Revenue': escrow_revenue,
         'Collections_Revenue': collections_revenue,
         'Total_Revenue': total_revenue,
-        'AWS_Costs': aws_total,
-        'Dev_Costs': dev_costs,
-        'Marketing_Costs': marketing,
-        'Compliance_Costs': compliance,
-        'Multi_Cloud_Costs': multi_cloud,
-        'Total_Costs': total_costs,
-        'Profit': profit,
-        'Profit_Margin': profit_margin
+        'Profit': total_revenue - total_costs,
+        'Absa_Share': absa_share,
+        'New_Customers': new_customers,
+        'Cross_Sell': cross_sell_revenue
     })
 
 # ============================================================================
@@ -151,14 +126,12 @@ def generate_financial_data():
 
 def main():
     
-    # Header
-    st.markdown('<p class="main-header">Shifa — Cost & Revenue Dashboard</p>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-header">Year 1 Projections · Invoice-to-Cash Marketplace</p>', unsafe_allow_html=True)
+    st.markdown('<p class="main-header">Shifa — Financial Model</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sub-header">2027 Projections · Invoice-to-Cash Marketplace</p>', unsafe_allow_html=True)
     
-    # Load data
     data = generate_financial_data()
+    total = data.sum()
     latest = data.iloc[-1]
-    total_annual = data.sum()
     
     # =========================================================================
     # KPI ROW
@@ -169,7 +142,7 @@ def main():
     with col1:
         st.markdown(f"""
         <div class="metric-card">
-            <div class="metric-value">R{total_annual['Total_Revenue']/1e6:,.1f}M</div>
+            <div class="metric-value">R{total['Total_Revenue']/1e6:,.1f}M</div>
             <div class="metric-label">Annual Revenue</div>
         </div>
         """, unsafe_allow_html=True)
@@ -177,7 +150,7 @@ def main():
     with col2:
         st.markdown(f"""
         <div class="metric-card">
-            <div class="metric-value">R{total_annual['Total_Costs']/1e6:,.1f}M</div>
+            <div class="metric-value">R{total['Total_Costs']/1e6:,.2f}M</div>
             <div class="metric-label">Annual Costs</div>
         </div>
         """, unsafe_allow_html=True)
@@ -185,41 +158,38 @@ def main():
     with col3:
         st.markdown(f"""
         <div class="metric-card">
-            <div class="metric-value" style="color: {'#28a745' if total_annual['Profit'] > 0 else '#dc3545'}">
-                R{total_annual['Profit']/1e6:,.1f}M
-            </div>
+            <div class="metric-value" style="color: #28a745;">R{(total['Total_Revenue'] - total['Total_Costs'])/1e6:,.1f}M</div>
             <div class="metric-label">Annual Profit</div>
         </div>
         """, unsafe_allow_html=True)
     
     with col4:
+        profit_margin = ((total['Total_Revenue'] - total['Total_Costs']) / total['Total_Revenue']) * 100
         st.markdown(f"""
         <div class="metric-card">
-            <div class="metric-value" style="color: {'#28a745' if total_annual['Profit_Margin']/12 > 10 else '#6c757d'}">
-                {total_annual['Profit_Margin']/12:.1f}%
-            </div>
-            <div class="metric-label">Avg Profit Margin</div>
+            <div class="metric-value" style="color: #28a745;">{profit_margin:.1f}%</div>
+            <div class="metric-label">Profit Margin</div>
         </div>
         """, unsafe_allow_html=True)
     
     with col5:
         st.markdown(f"""
         <div class="metric-card">
-            <div class="metric-value">{int(total_annual['Invoices']):,}</div>
-            <div class="metric-label">Annual Invoices</div>
+            <div class="metric-value">{int(total['Invoices']):,}</div>
+            <div class="metric-label">Total Invoices (2027)</div>
         </div>
         """, unsafe_allow_html=True)
     
     st.markdown("---")
     
     # =========================================================================
-    # CHART 1: Revenue vs Costs (Monthly)
+    # CHARTS
     # =========================================================================
     
     col1, col2 = st.columns([2, 1])
     
     with col1:
-        st.subheader("Revenue & Costs")
+        st.subheader("Revenue vs Costs (Monthly)")
         
         fig, ax = plt.subplots(figsize=(10, 4))
         
@@ -230,13 +200,9 @@ def main():
         ax.fill_between(data['Month'], data['Total_Revenue']/1000, 
                         data['Total_Costs']/1000, 
                         where=(data['Total_Revenue'] > data['Total_Costs']),
-                        color='#28a745', alpha=0.15, label='Profit Zone')
-        ax.fill_between(data['Month'], data['Total_Revenue']/1000, 
-                        data['Total_Costs']/1000, 
-                        where=(data['Total_Revenue'] < data['Total_Costs']),
-                        color='#dc3545', alpha=0.15, label='Loss Zone')
+                        color='#28a745', alpha=0.15)
         
-        ax.set_xlabel('2026')
+        ax.set_xlabel('2027')
         ax.set_ylabel('R Thousands')
         ax.legend(loc='upper left')
         ax.grid(True, alpha=0.3)
@@ -244,27 +210,21 @@ def main():
         st.pyplot(fig)
     
     with col2:
-        st.subheader("Breakdown")
+        st.subheader("Revenue Sources")
         
-        # Revenue breakdown pie
         fig2, ax2 = plt.subplots(figsize=(5, 4))
         
-        revenue_sources = [
-            total_annual['Fee_Revenue'],
-            total_annual['Escrow_Revenue'],
-            total_annual['Collections_Revenue']
-        ]
+        sources = [total['Fee_Revenue'], total['Escrow_Revenue'], total['Collections_Revenue']]
         labels = ['Transaction Fees', 'Escrow Fees', 'Collections']
         colors = ['#2E86C1', '#28a745', '#8E44AD']
         
-        ax2.pie(revenue_sources, labels=labels, autopct='%1.0f%%', colors=colors, startangle=90)
+        ax2.pie(sources, labels=labels, autopct='%1.0f%%', colors=colors, startangle=90)
         ax2.axis('equal')
-        ax2.set_title('Revenue Sources')
         
         st.pyplot(fig2)
     
     # =========================================================================
-    # CHART 2: Cost Breakdown
+    # COST BREAKDOWN
     # =========================================================================
     
     col1, col2 = st.columns([1, 1])
@@ -274,98 +234,57 @@ def main():
         
         fig3, ax3 = plt.subplots(figsize=(8, 4))
         
-        cost_categories = [
-            total_annual['AWS_Costs'],
-            total_annual['Dev_Costs'],
-            total_annual['Marketing_Costs'],
-            total_annual['Compliance_Costs'],
-            total_annual['Multi_Cloud_Costs']
-        ]
-        cost_labels = ['AWS Infrastructure', 'Development', 'Marketing', 'Compliance', 'Multi-Cloud']
-        colors = ['#3498db', '#2ecc71', '#f39c12', '#e74c3c', '#9b59b6']
+        costs = [total['AWS_Costs'], total['Multi_Cloud'], total['Dev_Costs'], 
+                 total['Marketing'], total['Compliance']]
+        labels = ['AWS', 'Multi-Cloud', 'Development', 'Marketing', 'Compliance']
+        colors = ['#3498db', '#9b59b6', '#2ecc71', '#f39c12', '#e74c3c']
         
-        bars = ax3.bar(cost_labels, [c/1000 for c in cost_categories], color=colors)
+        bars = ax3.bar(labels, [c/1000 for c in costs], color=colors)
         ax3.set_ylabel('R Thousands')
-        ax3.set_title('Annual Cost Breakdown')
+        ax3.set_title('Annual Cost Breakdown (R{:.2f}M Total)'.format(total['Total_Costs']/1e6))
         ax3.tick_params(axis='x', rotation=15)
         
-        for bar, val in zip(bars, [c/1000 for c in cost_categories]):
-            ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 50,
+        for bar, val in zip(bars, [c/1000 for c in costs]):
+            ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 10,
                     f'R{val:,.0f}K', ha='center', va='bottom', fontsize=8)
         
         st.pyplot(fig3)
     
     with col2:
-        st.subheader("Monthly Profit Trend")
+        st.subheader("Absa Gains")
         
         fig4, ax4 = plt.subplots(figsize=(8, 4))
         
-        colors_profit = ['#28a745' if p > 0 else '#dc3545' for p in data['Profit']]
-        ax4.bar(data['Month'], data['Profit']/1000, color=colors_profit, alpha=0.7)
-        ax4.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
-        ax4.set_xlabel('2026')
+        absa_gains = [total['Absa_Share'], total['Cross_Sell']]
+        labels_gains = ['Fee Share', 'Cross-Sell']
+        colors_gains = ['#27AE60', '#2E86C1']
+        
+        bars_g = ax4.bar(labels_gains, [g/1000 for g in absa_gains], color=colors_gains)
         ax4.set_ylabel('R Thousands')
-        ax4.set_title('Monthly Profit / Loss')
-        ax4.grid(True, alpha=0.3, axis='y')
+        ax4.set_title('Absa Annual Gains')
+        
+        for bar, val in zip(bars_g, [g/1000 for g in absa_gains]):
+            ax4.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 10,
+                    f'R{val:,.0f}K', ha='center', va='bottom', fontsize=10)
         
         st.pyplot(fig4)
     
     # =========================================================================
-    # CHART 3: Unit Economics
+    # DETAILED TABLE
     # =========================================================================
     
-    st.subheader("Unit Economics Per Invoice")
-    
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        avg_revenue_per_invoice = total_annual['Total_Revenue'] / total_annual['Invoices']
-        st.metric("Revenue / Invoice", f"R{avg_revenue_per_invoice:,.0f}")
-    
-    with col2:
-        avg_cost_per_invoice = total_annual['Total_Costs'] / total_annual['Invoices']
-        st.metric("Cost / Invoice", f"R{avg_cost_per_invoice:,.0f}")
-    
-    with col3:
-        avg_profit_per_invoice = (total_annual['Total_Revenue'] - total_annual['Total_Costs']) / total_annual['Invoices']
-        st.metric("Profit / Invoice", f"R{avg_profit_per_invoice:,.0f}")
-    
-    with col4:
-        break_even_volume = total_annual['Total_Costs'].iloc[0] / avg_revenue_per_invoice
-        st.metric("Break-Even Volume", f"{int(break_even_volume):,} / month")
-    
-    # =========================================================================
-    # COST STRUCTURE TABLE
-    # =========================================================================
-    
-    with st.expander("View Detailed Cost & Revenue Table"):
+    with st.expander("📊 View Detailed Monthly Data"):
         
-        # Revenue breakdown by month
-        st.subheader("Revenue Breakdown")
-        revenue_table = pd.DataFrame({
+        display = pd.DataFrame({
             'Month': data['Month'],
             'Invoices': data['Invoices'],
-            'Transaction Fees (R)': data['Fee_Revenue'].apply(lambda x: f"R{x:,.0f}"),
-            'Escrow Fees (R)': data['Escrow_Revenue'].apply(lambda x: f"R{x:,.0f}"),
-            'Collections (R)': data['Collections_Revenue'].apply(lambda x: f"R{x:,.0f}"),
-            'Total Revenue (R)': data['Total_Revenue'].apply(lambda x: f"R{x:,.0f}"),
+            'Revenue (R)': data['Total_Revenue'].apply(lambda x: f"R{x:,.0f}"),
+            'Costs (R)': data['Total_Costs'].apply(lambda x: f"R{x:,.0f}"),
             'Profit (R)': data['Profit'].apply(lambda x: f"R{x:,.0f}"),
-            'Margin %': data['Profit_Margin'].apply(lambda x: f"{x:.1f}%")
+            'Absa Share (R)': data['Absa_Share'].apply(lambda x: f"R{x:,.0f}"),
+            'New Customers': data['New_Customers'].apply(lambda x: f"{int(x):,}")
         })
-        st.dataframe(revenue_table, use_container_width=True)
-        
-        st.subheader("Cost Breakdown")
-        cost_table = pd.DataFrame({
-            'Month': data['Month'],
-            'Invoices': data['Invoices'],
-            'AWS Costs (R)': data['AWS_Costs'].apply(lambda x: f"R{x:,.0f}"),
-            'Development (R)': data['Dev_Costs'].apply(lambda x: f"R{x:,.0f}"),
-            'Marketing (R)': data['Marketing_Costs'].apply(lambda x: f"R{x:,.0f}"),
-            'Compliance (R)': data['Compliance_Costs'].apply(lambda x: f"R{x:,.0f}"),
-            'Multi-Cloud (R)': data['Multi_Cloud_Costs'].apply(lambda x: f"R{x:,.0f}"),
-            'Total Costs (R)': data['Total_Costs'].apply(lambda x: f"R{x:,.0f}")
-        })
-        st.dataframe(cost_table, use_container_width=True)
+        st.dataframe(display, use_container_width=True)
 
 if __name__ == "__main__":
     main()
