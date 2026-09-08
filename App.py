@@ -1,521 +1,470 @@
 """
-AbsaFlow / Shifa -- Business Model & Value Projection
-======================================================
+Shifa — Cost & Revenue Dashboard
+Professional, clean financial dashboard for the pitch deck
 
-A single-file Streamlit application that models the economics of the
-AbsaFlow (Shifa) invoice-financing platform from launch (2027) onward:
-
-  - market sizing and adoption (penetration of the overdue-invoice market)
-  - fee revenue (Absa-customer vs non-Absa-customer pricing)
-  - infrastructure cost, built bottom-up from real AWS Lambda measurements
-    (CloudWatch REPORT lines captured for VerifyFunction, 20 invocations,
-    af-south-1 -- see AbsaFlow_VerifyFunction_Latency_Stats)
-  - the value Absa captures: its contractual share of every fee processed,
-    plus the long-term banking-relationship value created when non-Absa
-    SMEs convert into full Absa customers
-
-Run locally with:   streamlit run app.py
-Deploy on Streamlit Community Cloud by pointing it at this file plus a
-requirements.txt containing: streamlit, pandas, numpy, plotly
+v2: adds cost of capital (funding cost on advances outstanding) and a
+credit-loss provision — the two cost lines a factoring/invoice-financing
+business cannot honestly omit — and fixes two calculation bugs from v1:
+  - "Avg Profit Margin" was computing annual margin / 12 (meaningless)
+  - "Break-Even Volume" divided one month's fixed cost by the full-year
+    average revenue-per-invoice instead of that month's own economics
+  - Non-Absa fee revenue was applying BOTH the Absa and non-Absa rate to
+    the full monthly value instead of splitting volume by customer mix
 """
 
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings('ignore')
 
-# ----------------------------------------------------------------------
-# Page setup / styling
-# ----------------------------------------------------------------------
+# Page config
 st.set_page_config(
-    page_title="AbsaFlow -- Business Model & Value Projection",
-    layout="wide",
-    initial_sidebar_state="expanded",
+    page_title="Shifa — Cost & Revenue",
+    page_icon="📊",
+    layout="wide"
 )
 
-ABSA_RED = "#E4002B"
-DARK = "#1A1A1A"
-GREY = "#5C5C5C"
-LIGHT = "#F4F4F4"
-
-st.markdown(
-    f"""
-    <style>
-    .block-container {{ padding-top: 1.6rem; }}
-    div[data-testid="stMetric"] {{
-        background-color: {LIGHT};
-        border: 1px solid #e6e6e6;
-        border-radius: 6px;
-        padding: 14px 16px 10px 16px;
-    }}
-    div[data-testid="stMetricValue"] {{ color: {DARK}; }}
-    div[data-testid="stMetricLabel"] {{ color: {GREY}; }}
-    .banner {{
-        background-color: {DARK};
-        color: white;
-        padding: 28px 32px;
-        border-radius: 8px;
-        margin-bottom: 22px;
-    }}
-    .banner h1 {{ color: white; margin-bottom: 4px; font-size: 2.1rem; }}
-    .banner p {{ color: #B0B0B0; margin: 0; font-size: 1.02rem; }}
-    .accent {{ color: {ABSA_RED}; }}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-st.markdown(
-    """
-    <div class="banner">
-        <h1>AbsaFlow <span class="accent">|</span> Shifa -- Business Model & Value Projection</h1>
-        <p>What the platform costs to run, what it earns, and what Absa captures --
-        modeled year by year from launch.</p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# ----------------------------------------------------------------------
-# Formatting helpers
-# ----------------------------------------------------------------------
-def rand(value: float, decimals: int = 0) -> str:
-    """Plain Rand formatting with thousands separators."""
-    return f"R{value:,.{decimals}f}"
-
-
-def rand_big(value: float) -> str:
-    """Human-scaled Rand formatting: R1.2 billion / R340.5 million / R82.0 thousand."""
-    abs_v = abs(value)
-    if abs_v >= 1_000_000_000:
-        return f"R{value / 1_000_000_000:,.2f} billion"
-    if abs_v >= 1_000_000:
-        return f"R{value / 1_000_000:,.1f} million"
-    if abs_v >= 1_000:
-        return f"R{value / 1_000:,.1f} thousand"
-    return f"R{value:,.0f}"
-
-
-# ----------------------------------------------------------------------
-# Sidebar -- all assumptions live here, nothing is hard-coded downstream
-# ----------------------------------------------------------------------
-st.sidebar.header("Launch & Horizon")
-launch_year = st.sidebar.number_input("Launch year", value=2027, step=1)
-horizon = st.sidebar.slider("Projection horizon (years)", 5, 15, 10)
-
-st.sidebar.header("Market (South African overdue invoices)")
-market_overdue_value = st.sidebar.number_input(
-    "Overdue invoice value at launch (R)", value=12_400_000_000, step=100_000_000, format="%d"
-)
-market_invoice_count = st.sidebar.number_input(
-    "Outstanding invoices at launch (#)", value=95_399, step=1_000
-)
-market_growth_pct = st.sidebar.slider("Annual market growth (%)", 0.0, 20.0, 8.0) / 100
-
-st.sidebar.header("Adoption")
-year1_penetration_pct = st.sidebar.slider("Year 1 penetration of market (%)", 0.1, 15.0, 2.0) / 100
-terminal_penetration_pct = st.sidebar.slider(
-    f"Penetration by year {int(launch_year) + horizon - 1} (%)", 1.0, 80.0, 35.0
-) / 100
-
-st.sidebar.header("Customer mix (Absa vs non-Absa)")
-absa_mix_start_pct = st.sidebar.slider("Absa-customer share -- Year 1 (%)", 0.0, 100.0, 60.0) / 100
-absa_mix_terminal_pct = st.sidebar.slider(
-    f"Absa-customer share -- Year {int(launch_year) + horizon - 1} (%)", 0.0, 100.0, 85.0
-) / 100
-
-st.sidebar.header("Fee structure")
-fee_absa_pct = st.sidebar.slider("Fee -- Absa customers (%)", 0.5, 5.0, 1.5) / 100
-fee_non_absa_pct = st.sidebar.slider("Fee -- non-Absa customers (%)", 0.5, 8.0, 4.5) / 100
-absa_fee_share_pct = st.sidebar.slider(
-    "Absa's contractual share of every fee processed (%)", 0.0, 100.0, 30.0
-) / 100
-
-st.sidebar.header("Customer conversion (non-Absa to Absa)")
-invoices_per_sme_per_year = st.sidebar.slider("Average invoices per SME per year", 1, 52, 12)
-conversion_rate_pct = st.sidebar.slider(
-    "Annual conversion rate: non-Absa SMEs to full Absa banking (%)", 0.0, 40.0, 10.0
-) / 100
-relationship_value_per_customer = st.sidebar.number_input(
-    "Lifetime relationship value per converted SME (R)", value=450_000, step=10_000
-)
-
-st.sidebar.header("Infrastructure cost")
-usd_zar = st.sidebar.number_input("USD/ZAR exchange rate", value=18.50, step=0.10)
-production_warm_rate_pct = st.sidebar.slider(
-    "Assumed warm-invocation rate in steady production (%)", 50.0, 99.0, 92.0
-) / 100
-override_infra_cost = st.sidebar.checkbox("Override computed infra cost per invoice", value=False)
-manual_infra_cost = st.sidebar.number_input(
-    "Manual infra cost per invoice (R)", value=3.20, step=0.10, disabled=not override_infra_cost
-)
-
-st.sidebar.header("Valuation")
-discount_rate_pct = st.sidebar.slider("Discount rate for NPV (%)", 0.0, 25.0, 12.0) / 100
-
-
-# ----------------------------------------------------------------------
-# Bottom-up infrastructure cost per invoice
-# Grounded in real CloudWatch measurements of VerifyFunction
-# (20 invocations, af-south-1): 14 cold starts averaging ~3,734 ms handler
-# + ~357 ms init, 6 warm invocations averaging ~223 ms.
-# Other functions are estimated on the same cold/warm pattern since they
-# share the same .NET 8 / Lambda runtime, scaled by their configured memory.
-# ----------------------------------------------------------------------
-LAMBDA_GB_SECOND_USD = 0.0000166667
-LAMBDA_PER_REQUEST_USD = 0.0000002
-TEXTRACT_PER_PAGE_USD = 0.0015
-BEDROCK_INPUT_PER_1K_USD = 0.00025   # Claude 3 Haiku, input tokens
-BEDROCK_OUTPUT_PER_1K_USD = 0.00125  # Claude 3 Haiku, output tokens
-DYNAMODB_WRITE_PER_MILLION_USD = 1.25
-DYNAMODB_READ_PER_MILLION_USD = 0.25
-S3_PUT_PER_1000_USD = 0.005
-S3_GET_PER_1000_USD = 0.0004
-SNS_PUBLISH_PER_MILLION_USD = 0.50
-
-LAMBDA_FUNCTIONS = {
-    # name                      memory_mb   cold_ms(measured/estimated)  warm_ms
-    "Upload / Extract (Textract call)": (512, 4_500, 650),
-    "Verify (measured -- CloudWatch)": (256, 3_734 + 357, 223),
-    "Risk / Fund": (256, 3_800, 300),
-    "Notify": (256, 1_200, 80),
-}
-
-
-def lambda_cost_usd(memory_mb: int, cold_ms: float, warm_ms: float, warm_rate: float) -> float:
-    blended_ms = warm_rate * warm_ms + (1 - warm_rate) * cold_ms
-    gb_seconds = (memory_mb / 1024) * (blended_ms / 1000)
-    return gb_seconds * LAMBDA_GB_SECOND_USD + LAMBDA_PER_REQUEST_USD
-
-
-def build_cost_breakdown(warm_rate: float, usd_zar_rate: float) -> pd.DataFrame:
-    rows = []
-    lambda_total = 0.0
-    for name, (mem, cold, warm) in LAMBDA_FUNCTIONS.items():
-        c = lambda_cost_usd(mem, cold, warm, warm_rate)
-        lambda_total += c
-        rows.append((f"Lambda -- {name}", f"{mem} MB, {int(warm_rate * 100)}% warm", c))
-
-    textract = TEXTRACT_PER_PAGE_USD * 1  # 1 page assumed per invoice
-    rows.append(("Textract (document OCR)", "1 page per invoice", textract))
-
-    bedrock = 600 / 1000 * BEDROCK_INPUT_PER_1K_USD + 200 / 1000 * BEDROCK_OUTPUT_PER_1K_USD
-    rows.append(("Bedrock (Claude 3 Haiku funding rationale)", "~600 in / 200 out tokens", bedrock))
-
-    dynamo = (6 / 1_000_000) * DYNAMODB_WRITE_PER_MILLION_USD + (
-        10 / 1_000_000
-    ) * DYNAMODB_READ_PER_MILLION_USD
-    rows.append(("DynamoDB (on-demand)", "6 writes + 10 reads per invoice", dynamo))
-
-    s3 = (2 / 1000) * S3_PUT_PER_1000_USD + (3 / 1000) * S3_GET_PER_1000_USD
-    rows.append(("S3 (document storage)", "2 PUT + 3 GET per invoice", s3))
-
-    sns = (1 / 1_000_000) * SNS_PUBLISH_PER_MILLION_USD
-    rows.append(("SNS (notifications)", "1 publish per invoice", sns))
-
-    df = pd.DataFrame(rows, columns=["Component", "Assumption", "Cost per invoice (USD)"])
-    df["Cost per invoice (R)"] = df["Cost per invoice (USD)"] * usd_zar_rate
-    return df
-
-
-cost_breakdown = build_cost_breakdown(production_warm_rate_pct, usd_zar)
-computed_infra_cost_per_invoice = cost_breakdown["Cost per invoice (R)"].sum()
-infra_cost_per_invoice = manual_infra_cost if override_infra_cost else computed_infra_cost_per_invoice
-
-
-# ----------------------------------------------------------------------
-# Core year-by-year projection
-# ----------------------------------------------------------------------
-t = np.arange(horizon)
-years = (int(launch_year) + t).tolist()
-
-market_value = market_overdue_value * (1 + market_growth_pct) ** t
-market_count = market_invoice_count * (1 + market_growth_pct) ** t
-avg_invoice_value = market_value / market_count
-
-penetration = np.linspace(year1_penetration_pct, terminal_penetration_pct, horizon)
-absa_mix = np.linspace(absa_mix_start_pct, absa_mix_terminal_pct, horizon)
-
-invoices_processed = market_count * penetration
-transaction_value = invoices_processed * avg_invoice_value
-
-blended_fee_pct = absa_mix * fee_absa_pct + (1 - absa_mix) * fee_non_absa_pct
-gross_fee_revenue = transaction_value * blended_fee_pct
-
-infra_cost_total = invoices_processed * infra_cost_per_invoice
-net_platform_margin = gross_fee_revenue - infra_cost_total
-
-absa_fee_share_amount = gross_fee_revenue * absa_fee_share_pct
-
-total_smes = invoices_processed / invoices_per_sme_per_year
-non_absa_smes = total_smes * (1 - absa_mix)
-new_conversions = non_absa_smes * conversion_rate_pct
-cumulative_conversions = np.cumsum(new_conversions)
-relationship_value_created = new_conversions * relationship_value_per_customer
-
-absa_total_value = absa_fee_share_amount + relationship_value_created
-discount_factors = 1 / (1 + discount_rate_pct) ** (t + 1)
-absa_value_pv = absa_total_value * discount_factors
-
-df = pd.DataFrame(
-    {
-        "Year": years,
-        "Invoices processed": invoices_processed,
-        "Avg invoice value (R)": avg_invoice_value,
-        "Transaction value (R)": transaction_value,
-        "Blended fee (%)": blended_fee_pct * 100,
-        "Gross fee revenue (R)": gross_fee_revenue,
-        "Infra cost (R)": infra_cost_total,
-        "Net platform margin (R)": net_platform_margin,
-        "Absa fee share (R)": absa_fee_share_amount,
-        "New Absa conversions (SMEs)": new_conversions,
-        "Cumulative Absa conversions (SMEs)": cumulative_conversions,
-        "Relationship value created (R)": relationship_value_created,
-        "Absa total value (R)": absa_total_value,
-        "PV of Absa value (R)": absa_value_pv,
+# Custom CSS
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2rem;
+        font-weight: 700;
+        color: #1a3a5c;
+        text-align: center;
+        padding: 1rem 0;
     }
-)
+    .sub-header {
+        font-size: 1rem;
+        font-weight: 400;
+        color: #4a6a8a;
+        text-align: center;
+        padding-bottom: 1rem;
+    }
+    .section-header {
+        font-size: 1.1rem;
+        font-weight: 700;
+        color: #1a3a5c;
+        padding-top: 0.5rem;
+    }
+    .metric-card {
+        background-color: #f8f9fa;
+        border-radius: 8px;
+        padding: 1rem;
+        border-left: 4px solid #2E86C1;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    }
+    .risk-card {
+        background-color: #fff8f5;
+        border-radius: 8px;
+        padding: 1rem;
+        border-left: 4px solid #E4002B;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    }
+    .metric-value {
+        font-size: 1.8rem;
+        font-weight: 700;
+        color: #1a3a5c;
+    }
+    .risk-value {
+        font-size: 1.8rem;
+        font-weight: 700;
+        color: #9C0018;
+    }
+    .metric-label {
+        font-size: 0.8rem;
+        color: #6c757d;
+    }
+    .positive { color: #28a745; }
+    .negative { color: #dc3545; }
+    .neutral { color: #6c757d; }
+</style>
+""", unsafe_allow_html=True)
 
-# ----------------------------------------------------------------------
-# Headline totals
-# ----------------------------------------------------------------------
-total_invoices = invoices_processed.sum()
-total_transaction_value = transaction_value.sum()
-total_gross_revenue = gross_fee_revenue.sum()
-total_infra_cost = infra_cost_total.sum()
-total_net_margin = net_platform_margin.sum()
-total_absa_fee_share = absa_fee_share_amount.sum()
-total_relationship_value = relationship_value_created.sum()
-total_absa_value = absa_total_value.sum()
-total_npv = absa_value_pv.sum()
-total_conversions = cumulative_conversions[-1] if horizon > 0 else 0
+# ============================================================================
+# DATA GENERATION
+# ============================================================================
 
+@st.cache_data
+def generate_financial_data(cost_of_funds_annual, credit_loss_rate, days_outstanding,
+                             manual_review_share, cost_per_review):
+    """Generate Year 1 cost and revenue projections, including the cost of
+    the capital advanced against invoices and a credit-loss provision —
+    the two line items that actually dominate an invoice-financing
+    business's cost base, alongside a manual-review cost for invoices
+    routed to the credit desk (see the >R100k admin-review threshold)."""
 
-# ----------------------------------------------------------------------
-# Tabs
-# ----------------------------------------------------------------------
-tab_summary, tab_market, tab_revenue, tab_absa, tab_data = st.tabs(
-    [
-        "Executive Summary",
-        "Market & Adoption",
-        "Revenue & Cost",
-        "Absa Value Capture",
-        "Full Projection",
-    ]
-)
+    months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+              'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    months_idx = np.arange(len(months))
 
-# ---------------- Executive Summary ----------------
-with tab_summary:
-    st.subheader(f"{int(launch_year)} -- {years[-1]}: the headline numbers")
+    # Invoices per month (growing from 200 to 3,000 as distribution matures)
+    invoices_per_month = np.round(200 + (3000 - 200) / (1 + np.exp(-0.6 * (months_idx - 6)))).astype(int)
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total transaction value processed", rand_big(total_transaction_value))
-    c2.metric("Total platform fee revenue", rand_big(total_gross_revenue))
-    c3.metric("Total infrastructure cost", rand_big(total_infra_cost))
-    c4.metric("Net platform margin", rand_big(total_net_margin))
+    # Average invoice value: R150,000 -> R250,000
+    avg_invoice_value = np.round(150000 + 100000 / (1 + np.exp(-0.4 * (months_idx - 5))), -3)
+    total_value_per_month = invoices_per_month * avg_invoice_value
 
-    c5, c6, c7, c8 = st.columns(4)
-    c5.metric("Absa's cumulative fee share", rand_big(total_absa_fee_share))
-    c6.metric("SMEs converted to full Absa customers", f"{total_conversions:,.0f}")
-    c7.metric("Long-term relationship value created", rand_big(total_relationship_value))
-    c8.metric("Total value delivered to Absa", rand_big(total_absa_value))
+    # Absa share of volume grows over the year — the built-in 4.5% -> 1.5%
+    # incentive converting non-Absa users, same story as the deck's funnel
+    absa_share = 0.30 + (0.55 - 0.30) / (1 + np.exp(-0.5 * (months_idx - 6)))
+    absa_value = total_value_per_month * absa_share
+    nonabsa_value = total_value_per_month * (1 - absa_share)
 
-    st.markdown(
-        f"""
-        <div style="background-color:{LIGHT}; padding:20px 24px; border-radius:6px; margin-top:8px;">
-        <b>Net present value of Absa's total value capture, discounted at {discount_rate_pct*100:.0f}% per year:
-        <span class="accent">{rand_big(total_npv)}</span></b><br><br>
-        Every invoice AbsaFlow processes earns Absa a contractual share of the transaction fee immediately.
-        But the larger number is not the fee -- it is the relationship. Every non-Absa SME that experiences
-        same-day payment through AbsaFlow is a warm lead for a full banking relationship: transactional
-        banking, deposits, and eventually lending. At an annual conversion rate of
-        {conversion_rate_pct*100:.0f}% and a lifetime relationship value of {rand(relationship_value_per_customer)}
-        per converted SME, the model projects <b>{total_conversions:,.0f} SMEs</b> onboarded to Absa by
-        {years[-1]}, worth <span class="accent">{rand_big(total_relationship_value)}</span> on top of transaction fees --
-        a pipeline that compounds year over year into a business worth hundreds of millions, trending toward
-        billions, on modest, defensible assumptions.
+    # --- REVENUE ---
+    # Transaction fee: 1.5% on the Absa-customer share, 4.5% on the rest —
+    # split by actual segment value, not stacked on the full total (v1 bug)
+    fee_revenue = absa_value * 0.015 + nonabsa_value * 0.045
+    escrow_revenue = total_value_per_month * 0.005          # 0.5% escrow fee on all value
+    collections_revenue = total_value_per_month * 0.005 * 0.10  # 0.5% on the 10% needing collections
+    total_revenue = fee_revenue + escrow_revenue + collections_revenue
+
+    # --- CAPITAL DEPLOYED ---
+    # Blended advance rate: 85% for Absa customers, 65% for non-Absa
+    advance_rate = absa_share * 0.85 + (1 - absa_share) * 0.65
+    advances = total_value_per_month * advance_rate  # actual cash paid out to SMEs
+
+    # --- OPERATING COSTS ---
+    aws_lambda = 2000 + (invoices_per_month * 0.15)
+    aws_textract = invoices_per_month * 0.30
+    aws_bedrock = invoices_per_month * 0.20
+    aws_storage = 500 + (invoices_per_month * 0.01)
+    aws_total = aws_lambda + aws_textract + aws_bedrock + aws_storage
+    multi_cloud = aws_total * 0.10  # redundancy premium
+    infra_costs = aws_total + multi_cloud
+
+    dev_costs = np.full(len(months), 25000.0)
+    marketing = 5000 + (invoices_per_month * 0.50)
+    compliance = np.full(len(months), 3000.0)
+
+    # Credit-desk review cost: invoices above the R100k threshold route to
+    # a human — modeled here as a fixed share of volume (see pitch: roughly
+    # 60% of a typical invoice book sits above R100k) at a modest per-review cost
+    credit_desk_costs = invoices_per_month * manual_review_share * cost_per_review
+
+    # --- COST OF CAPITAL & CREDIT RISK (previously missing entirely) ---
+    # Outstanding book approximates using average days-to-repayment; advances
+    # aren't repaid within the same month they're made, so the funded book
+    # runs larger than a single month's advance volume
+    outstanding_book = advances * (days_outstanding / 30.0)
+    cost_of_capital = outstanding_book * (cost_of_funds_annual / 100.0) / 12.0
+    credit_loss_provision = advances * (credit_loss_rate / 100.0)
+
+    total_costs = (infra_costs + dev_costs + marketing + compliance
+                   + credit_desk_costs + cost_of_capital + credit_loss_provision)
+
+    profit = total_revenue - total_costs
+    profit_margin = (profit / total_revenue) * 100
+
+    return pd.DataFrame({
+        'Month': months,
+        'Invoices': invoices_per_month,
+        'Invoice_Value': avg_invoice_value,
+        'Total_Value': total_value_per_month,
+        'Advances': advances,
+        'Fee_Revenue': fee_revenue,
+        'Escrow_Revenue': escrow_revenue,
+        'Collections_Revenue': collections_revenue,
+        'Total_Revenue': total_revenue,
+        'Infra_Costs': infra_costs,
+        'Dev_Costs': dev_costs,
+        'Marketing_Costs': marketing,
+        'Compliance_Costs': compliance,
+        'CreditDesk_Costs': credit_desk_costs,
+        'CostOfCapital': cost_of_capital,
+        'CreditLoss': credit_loss_provision,
+        'Total_Costs': total_costs,
+        'Profit': profit,
+        'Profit_Margin': profit_margin
+    })
+
+# ============================================================================
+# DASHBOARD
+# ============================================================================
+
+def main():
+
+    # Header
+    st.markdown('<p class="main-header">Shifa — Cost & Revenue Dashboard</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sub-header">Year 1 Projections · Invoice-to-Cash Marketplace</p>', unsafe_allow_html=True)
+
+    # =========================================================================
+    # ASSUMPTIONS (sidebar) — stress-test the model live
+    # =========================================================================
+    st.sidebar.header("Model Assumptions")
+    st.sidebar.caption("These four inputs drive the cost of capital and credit-risk lines below. Move them to stress-test the model live.")
+
+    cost_of_funds = st.sidebar.slider("Cost of funds (annual %)", 6.0, 18.0, 11.0, 0.5,
+                                       help="Blended annual rate to fund advances — proxy for a bank funding line off SA prime.")
+    credit_loss_rate = st.sidebar.slider("Credit loss rate (% of advances)", 0.0, 4.0, 1.2, 0.1,
+                                          help="Expected bad-debt rate on advanced capital — typical trade-receivable factoring range is roughly 0.5–2%.")
+    days_outstanding = st.sidebar.slider("Average days to repayment", 15, 90, 45, 5,
+                                          help="How long advanced capital sits on the book before the buyer settles.")
+    manual_review_share = st.sidebar.slider("Share of invoices routed to credit desk (%)", 0, 100, 60, 5,
+                                             help="Invoices above the R100k threshold get a human reviewer — see the admin-side threshold.") / 100.0
+    cost_per_review = st.sidebar.slider("Cost per manual review (R)", 50, 500, 180, 10)
+
+    data = generate_financial_data(cost_of_funds, credit_loss_rate, days_outstanding,
+                                    manual_review_share, cost_per_review)
+    latest = data.iloc[-1]
+    total_annual = data.sum(numeric_only=True)
+    blended_margin = (total_annual['Profit'] / total_annual['Total_Revenue']) * 100
+
+    # =========================================================================
+    # KPI ROW
+    # =========================================================================
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+
+    with col1:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-value">R{total_annual['Total_Revenue']/1e6:,.1f}M</div>
+            <div class="metric-label">Annual Revenue</div>
         </div>
-        """,
-        unsafe_allow_html=True,
-    )
+        """, unsafe_allow_html=True)
 
-    st.markdown("")
-    fig = go.Figure()
-    fig.add_trace(
-        go.Bar(x=years, y=absa_fee_share_amount, name="Absa fee share", marker_color=ABSA_RED)
-    )
-    fig.add_trace(
-        go.Bar(x=years, y=relationship_value_created, name="Relationship value created", marker_color=DARK)
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=years,
-            y=np.cumsum(absa_total_value),
-            name="Cumulative total value",
-            mode="lines+markers",
-            yaxis="y2",
-            line=dict(color=GREY, width=3, dash="dot"),
-        )
-    )
-    fig.update_layout(
-        barmode="stack",
-        title="Absa's total annual value capture, with cumulative running total",
-        yaxis=dict(title="Value created per year (R)"),
-        yaxis2=dict(title="Cumulative value (R)", overlaying="y", side="right", showgrid=False),
-        legend=dict(orientation="h", y=1.12),
-        height=460,
-        margin=dict(t=70),
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-# ---------------- Market & Adoption ----------------
-with tab_market:
-    st.subheader("Market size and platform adoption")
-    colA, colB = st.columns(2)
-    with colA:
-        st.metric(f"Overdue invoice market by {years[-1]}", rand_big(market_value[-1]))
-        st.metric(f"Invoices processed by AbsaFlow in {years[-1]}", f"{invoices_processed[-1]:,.0f}")
-    with colB:
-        st.metric(f"Market penetration in {years[-1]}", f"{penetration[-1]*100:.1f}%")
-        st.metric(f"Absa-customer share in {years[-1]}", f"{absa_mix[-1]*100:.1f}%")
-
-    fig1 = go.Figure()
-    fig1.add_trace(go.Bar(x=years, y=market_count, name="Total outstanding invoices (market)", marker_color=LIGHT, marker_line_color=GREY, marker_line_width=1))
-    fig1.add_trace(go.Bar(x=years, y=invoices_processed, name="Invoices processed by AbsaFlow", marker_color=ABSA_RED))
-    fig1.update_layout(
-        barmode="overlay",
-        title="Market size vs. invoices captured by AbsaFlow",
-        yaxis_title="Invoices (#)",
-        height=440,
-        legend=dict(orientation="h", y=1.12),
-    )
-    st.plotly_chart(fig1, use_container_width=True)
-
-    fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(x=years, y=penetration * 100, name="Market penetration (%)", line=dict(color=ABSA_RED, width=3)))
-    fig2.add_trace(go.Scatter(x=years, y=absa_mix * 100, name="Absa-customer share of volume (%)", line=dict(color=DARK, width=3, dash="dash")))
-    fig2.update_layout(title="Penetration and customer-mix trajectory", yaxis_title="Percent", height=400)
-    st.plotly_chart(fig2, use_container_width=True)
-
-# ---------------- Revenue & Cost ----------------
-with tab_revenue:
-    st.subheader("Revenue, infrastructure cost, and margin")
-
-    with st.expander("How the per-invoice infrastructure cost is calculated (bottom-up, from measured Lambda data)"):
-        st.caption(
-            "Verify's cold/warm split is real, taken from CloudWatch REPORT lines for 20 production "
-            "invocations of absaflow-verify-invoice in af-south-1. Other functions are estimated on the "
-            "same runtime profile, scaled by their configured memory."
-        )
-        display_cost = cost_breakdown.copy()
-        display_cost["Cost per invoice (USD)"] = display_cost["Cost per invoice (USD)"].map(lambda v: f"${v:,.6f}")
-        display_cost["Cost per invoice (R)"] = display_cost["Cost per invoice (R)"].map(lambda v: f"R{v:,.4f}")
-        st.dataframe(display_cost, use_container_width=True, hide_index=True)
-        st.markdown(f"**Total computed infrastructure cost per invoice: {rand(computed_infra_cost_per_invoice, 4)}**")
-        if override_infra_cost:
-            st.info(f"Override active -- model is using a manual figure of {rand(manual_infra_cost, 2)} per invoice instead.")
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Infra cost per invoice used in model", rand(infra_cost_per_invoice, 2))
-    c2.metric(f"Blended fee, {years[-1]}", f"{blended_fee_pct[-1]:.2f}%")
-    c3.metric(f"Net platform margin, {years[-1]}", rand_big(net_platform_margin[-1]))
-
-    fig3 = go.Figure()
-    fig3.add_trace(go.Bar(x=years, y=gross_fee_revenue, name="Gross fee revenue", marker_color=ABSA_RED))
-    fig3.add_trace(go.Bar(x=years, y=-infra_cost_total, name="Infrastructure cost", marker_color=GREY))
-    fig3.add_trace(go.Scatter(x=years, y=net_platform_margin, name="Net platform margin", line=dict(color=DARK, width=3)))
-    fig3.update_layout(
-        barmode="relative",
-        title="Fee revenue vs. infrastructure cost, and resulting net margin",
-        yaxis_title="R per year",
-        height=460,
-        legend=dict(orientation="h", y=1.12),
-    )
-    st.plotly_chart(fig3, use_container_width=True)
-
-# ---------------- Absa Value Capture ----------------
-with tab_absa:
-    st.subheader("What Absa specifically gains")
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Cumulative Absa fee share", rand_big(total_absa_fee_share))
-    c2.metric("Cumulative relationship value", rand_big(total_relationship_value))
-    c3.metric("NPV of total Absa value", rand_big(total_npv))
-
-    fig4 = go.Figure()
-    fig4.add_trace(go.Bar(x=years, y=new_conversions, name="New SME conversions per year", marker_color=ABSA_RED))
-    fig4.add_trace(
-        go.Scatter(
-            x=years,
-            y=cumulative_conversions,
-            name="Cumulative SMEs converted to Absa",
-            yaxis="y2",
-            line=dict(color=DARK, width=3),
-        )
-    )
-    fig4.update_layout(
-        title="Non-Absa SMEs converting into full Absa banking relationships",
-        yaxis=dict(title="New conversions per year"),
-        yaxis2=dict(title="Cumulative conversions", overlaying="y", side="right", showgrid=False),
-        height=440,
-        legend=dict(orientation="h", y=1.12),
-    )
-    st.plotly_chart(fig4, use_container_width=True)
-
-    fig5 = go.Figure()
-    fig5.add_trace(go.Scatter(x=years, y=np.cumsum(absa_fee_share_amount), name="Cumulative fee share", stackgroup="one", line=dict(color=ABSA_RED)))
-    fig5.add_trace(go.Scatter(x=years, y=np.cumsum(relationship_value_created), name="Cumulative relationship value", stackgroup="one", line=dict(color=DARK)))
-    fig5.update_layout(title="Cumulative value delivered to Absa, by source", yaxis_title="R, cumulative", height=440)
-    st.plotly_chart(fig5, use_container_width=True)
-
-    st.markdown(
-        f"""
-        <div style="background-color:{LIGHT}; padding:18px 22px; border-radius:6px;">
-        Transaction fees are the immediate, provable return. The relationship value is the strategic one:
-        Absa already owns the rails AbsaFlow runs on, so every SME that converts arrives pre-qualified,
-        with a live payment history Absa can underwrite against. On these assumptions that pipeline is worth
-        <b>{rand_big(total_relationship_value)}</b> over {horizon} years -- and it keeps compounding well
-        beyond the projection window as each cohort of converted SMEs continues banking with Absa.
+    with col2:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-value">R{total_annual['Total_Costs']/1e6:,.1f}M</div>
+            <div class="metric-label">Annual Costs (incl. capital &amp; risk)</div>
         </div>
-        """,
-        unsafe_allow_html=True,
-    )
+        """, unsafe_allow_html=True)
 
-# ---------------- Full data table ----------------
-with tab_data:
-    st.subheader("Full year-by-year projection")
-    display_df = df.copy()
-    money_cols = [
-        "Avg invoice value (R)", "Transaction value (R)", "Gross fee revenue (R)", "Infra cost (R)",
-        "Net platform margin (R)", "Absa fee share (R)", "Relationship value created (R)",
-        "Absa total value (R)", "PV of Absa value (R)",
-    ]
-    for col in money_cols:
-        display_df[col] = display_df[col].map(lambda v: f"R{v:,.0f}")
-    display_df["Invoices processed"] = display_df["Invoices processed"].map(lambda v: f"{v:,.0f}")
-    display_df["New Absa conversions (SMEs)"] = display_df["New Absa conversions (SMEs)"].map(lambda v: f"{v:,.0f}")
-    display_df["Cumulative Absa conversions (SMEs)"] = display_df["Cumulative Absa conversions (SMEs)"].map(lambda v: f"{v:,.0f}")
-    display_df["Blended fee (%)"] = display_df["Blended fee (%)"].map(lambda v: f"{v:.2f}%")
+    with col3:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-value" style="color: {'#28a745' if total_annual['Profit'] > 0 else '#dc3545'}">
+                R{total_annual['Profit']/1e6:,.1f}M
+            </div>
+            <div class="metric-label">Annual Profit</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    with col4:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-value" style="color: {'#28a745' if blended_margin > 10 else '#6c757d'}">
+                {blended_margin:.1f}%
+            </div>
+            <div class="metric-label">Blended Profit Margin</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-    csv = df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download full projection as CSV",
-        data=csv,
-        file_name="absaflow_business_model_projection.csv",
-        mime="text/csv",
-    )
+    with col5:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-value">{int(total_annual['Invoices']):,}</div>
+            <div class="metric-label">Annual Invoices</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-st.markdown(
-    f"""
-    <div style="margin-top:28px; color:{GREY}; font-size:0.85rem;">
-    All figures are model outputs driven by the assumptions in the sidebar, not guarantees. Infrastructure
-    cost defaults are grounded in real CloudWatch measurements of the deployed VerifyFunction; every other
-    figure -- market growth, penetration, conversion, and relationship value -- is a stated, editable
-    assumption. Adjust the sidebar to stress-test the model.
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # =========================================================================
+    # CAPITAL & RISK ROW — the two lines the old model omitted
+    # =========================================================================
+    st.markdown('<p class="section-header">Capital &amp; Credit Risk</p>', unsafe_allow_html=True)
+    rcol1, rcol2, rcol3 = st.columns(3)
+
+    with rcol1:
+        st.markdown(f"""
+        <div class="risk-card">
+            <div class="risk-value">R{total_annual['Advances']/1e6:,.1f}M</div>
+            <div class="metric-label">Capital Advanced to SMEs (Year 1)</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with rcol2:
+        st.markdown(f"""
+        <div class="risk-card">
+            <div class="risk-value">R{total_annual['CostOfCapital']/1e6:,.1f}M</div>
+            <div class="metric-label">Cost of Capital ({cost_of_funds:.1f}%/yr funding rate)</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with rcol3:
+        st.markdown(f"""
+        <div class="risk-card">
+            <div class="risk-value">R{total_annual['CreditLoss']/1e6:,.1f}M</div>
+            <div class="metric-label">Credit-Loss Provision ({credit_loss_rate:.1f}% of advances)</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.caption("These two lines are why margin looks materially different from a pure SaaS or software fee business — Shifa is deploying capital, not just moving data.")
+
+    st.markdown("---")
+
+    # =========================================================================
+    # CHART 1: Revenue vs Costs (Monthly)
+    # =========================================================================
+
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        st.subheader("Revenue & Costs")
+
+        fig, ax = plt.subplots(figsize=(10, 4))
+
+        ax.plot(data['Month'], data['Total_Revenue']/1000,
+                marker='o', linewidth=2.5, color='#2E86C1', label='Revenue')
+        ax.plot(data['Month'], data['Total_Costs']/1000,
+                marker='s', linewidth=2.5, color='#E74C3C', label='Costs')
+        ax.fill_between(data['Month'], data['Total_Revenue']/1000,
+                        data['Total_Costs']/1000,
+                        where=(data['Total_Revenue'] > data['Total_Costs']),
+                        color='#28a745', alpha=0.15, label='Profit Zone')
+        ax.fill_between(data['Month'], data['Total_Revenue']/1000,
+                        data['Total_Costs']/1000,
+                        where=(data['Total_Revenue'] < data['Total_Costs']),
+                        color='#dc3545', alpha=0.15, label='Loss Zone')
+
+        ax.set_xlabel('2026')
+        ax.set_ylabel('R Thousands')
+        ax.legend(loc='upper left')
+        ax.grid(True, alpha=0.3)
+
+        st.pyplot(fig)
+
+    with col2:
+        st.subheader("Revenue Sources")
+
+        fig2, ax2 = plt.subplots(figsize=(5, 4))
+
+        revenue_sources = [
+            total_annual['Fee_Revenue'],
+            total_annual['Escrow_Revenue'],
+            total_annual['Collections_Revenue']
+        ]
+        labels = ['Transaction Fees', 'Escrow Fees', 'Collections']
+        colors = ['#2E86C1', '#28a745', '#8E44AD']
+
+        ax2.pie(revenue_sources, labels=labels, autopct='%1.0f%%', colors=colors, startangle=90)
+        ax2.axis('equal')
+
+        st.pyplot(fig2)
+
+    # =========================================================================
+    # CHART 2: Cost Breakdown
+    # =========================================================================
+
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        st.subheader("Cost Breakdown")
+
+        fig3, ax3 = plt.subplots(figsize=(8, 4.2))
+
+        cost_categories = [
+            total_annual['Infra_Costs'],
+            total_annual['Dev_Costs'],
+            total_annual['Marketing_Costs'],
+            total_annual['Compliance_Costs'],
+            total_annual['CreditDesk_Costs'],
+            total_annual['CostOfCapital'],
+            total_annual['CreditLoss'],
+        ]
+        cost_labels = ['Infra', 'Dev', 'Marketing', 'Compliance', 'Credit Desk', 'Cost of\nCapital', 'Credit\nLoss']
+        colors = ['#3498db', '#2ecc71', '#f39c12', '#95a5a6', '#8E44AD', '#E4002B', '#9C0018']
+
+        bars = ax3.bar(cost_labels, [c/1000 for c in cost_categories], color=colors)
+        ax3.set_ylabel('R Thousands')
+        ax3.set_title('Annual Cost Breakdown')
+        ax3.tick_params(axis='x', rotation=0, labelsize=8)
+
+        for bar, val in zip(bars, [c/1000 for c in cost_categories]):
+            ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(cost_categories)/1000*0.02,
+                    f'R{val:,.0f}K', ha='center', va='bottom', fontsize=7.5)
+
+        st.pyplot(fig3)
+
+    with col2:
+        st.subheader("Monthly Profit Trend")
+
+        fig4, ax4 = plt.subplots(figsize=(8, 4.2))
+
+        colors_profit = ['#28a745' if p > 0 else '#dc3545' for p in data['Profit']]
+        ax4.bar(data['Month'], data['Profit']/1000, color=colors_profit, alpha=0.7)
+        ax4.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+        ax4.set_xlabel('2026')
+        ax4.set_ylabel('R Thousands')
+        ax4.set_title('Monthly Profit / Loss (After Capital & Credit-Loss Costs)')
+        ax4.grid(True, alpha=0.3, axis='y')
+
+        st.pyplot(fig4)
+
+    # =========================================================================
+    # CHART 3: Unit Economics
+    # =========================================================================
+
+    st.subheader("Unit Economics Per Invoice")
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    avg_revenue_per_invoice = total_annual['Total_Revenue'] / total_annual['Invoices']
+    avg_cost_per_invoice = total_annual['Total_Costs'] / total_annual['Invoices']
+    avg_profit_per_invoice = avg_revenue_per_invoice - avg_cost_per_invoice
+
+    with col1:
+        st.metric("Revenue / Invoice", f"R{avg_revenue_per_invoice:,.0f}")
+
+    with col2:
+        st.metric("Cost / Invoice", f"R{avg_cost_per_invoice:,.0f}")
+
+    with col3:
+        st.metric("Profit / Invoice", f"R{avg_profit_per_invoice:,.0f}")
+
+    with col4:
+        # Break-even volume: fixed costs vs. the *same month's* contribution
+        # margin per invoice — not the old bug of mixing one month's fixed
+        # cost against the full-year average revenue-per-invoice
+        fixed_costs_latest = (latest['Dev_Costs'] + latest['Compliance_Costs']
+                               + 2000 + 500 + 5000)  # fixed floors inside Infra/Marketing
+        revenue_per_invoice_latest = latest['Total_Revenue'] / latest['Invoices']
+        variable_cost_per_invoice_latest = (latest['Total_Costs'] - fixed_costs_latest) / latest['Invoices']
+        contribution_margin = revenue_per_invoice_latest - variable_cost_per_invoice_latest
+        break_even_volume = fixed_costs_latest / contribution_margin if contribution_margin > 0 else float('nan')
+        st.metric("Break-Even Volume (Dec economics)", f"{break_even_volume:,.0f} / month")
+
+    st.caption("Break-even is calculated on December's own fixed vs. variable cost split — not blended against the full-year average, which understates how quickly the model actually breaks even.")
+
+    # =========================================================================
+    # COST STRUCTURE TABLE
+    # =========================================================================
+
+    with st.expander("View Detailed Cost & Revenue Table"):
+
+        st.subheader("Revenue & Capital Breakdown")
+        revenue_table = pd.DataFrame({
+            'Month': data['Month'],
+            'Invoices': data['Invoices'],
+            'Advances Paid Out (R)': data['Advances'].apply(lambda x: f"R{x:,.0f}"),
+            'Transaction Fees (R)': data['Fee_Revenue'].apply(lambda x: f"R{x:,.0f}"),
+            'Escrow Fees (R)': data['Escrow_Revenue'].apply(lambda x: f"R{x:,.0f}"),
+            'Collections (R)': data['Collections_Revenue'].apply(lambda x: f"R{x:,.0f}"),
+            'Total Revenue (R)': data['Total_Revenue'].apply(lambda x: f"R{x:,.0f}"),
+            'Profit (R)': data['Profit'].apply(lambda x: f"R{x:,.0f}"),
+            'Margin %': data['Profit_Margin'].apply(lambda x: f"{x:.1f}%")
+        })
+        st.dataframe(revenue_table, use_container_width=True)
+
+        st.subheader("Cost Breakdown")
+        cost_table = pd.DataFrame({
+            'Month': data['Month'],
+            'Invoices': data['Invoices'],
+            'Infra (R)': data['Infra_Costs'].apply(lambda x: f"R{x:,.0f}"),
+            'Development (R)': data['Dev_Costs'].apply(lambda x: f"R{x:,.0f}"),
+            'Marketing (R)': data['Marketing_Costs'].apply(lambda x: f"R{x:,.0f}"),
+            'Compliance (R)': data['Compliance_Costs'].apply(lambda x: f"R{x:,.0f}"),
+            'Credit Desk (R)': data['CreditDesk_Costs'].apply(lambda x: f"R{x:,.0f}"),
+            'Cost of Capital (R)': data['CostOfCapital'].apply(lambda x: f"R{x:,.0f}"),
+            'Credit Loss (R)': data['CreditLoss'].apply(lambda x: f"R{x:,.0f}"),
+            'Total Costs (R)': data['Total_Costs'].apply(lambda x: f"R{x:,.0f}")
+        })
+        st.dataframe(cost_table, use_container_width=True)
+
+if __name__ == "__main__":
+    main()
