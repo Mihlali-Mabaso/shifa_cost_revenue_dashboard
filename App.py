@@ -1,15 +1,16 @@
 """
-Shifa — Cost & Revenue Dashboard
-Professional, clean financial dashboard for the pitch deck
-
-v2: adds cost of capital (funding cost on advances outstanding) and a
-credit-loss provision — the two cost lines a factoring/invoice-financing
-business cannot honestly omit — and fixes two calculation bugs from v1:
-  - "Avg Profit Margin" was computing annual margin / 12 (meaningless)
-  - "Break-Even Volume" divided one month's fixed cost by the full-year
-    average revenue-per-invoice instead of that month's own economics
-  - Non-Absa fee revenue was applying BOTH the Absa and non-Absa rate to
-    the full monthly value instead of splitting volume by customer mix
+Shifa — 2027 Ramp, Fee Split & Startup Capital
+================================================
+Answers three judge questions directly:
+  1. Realistic invoice-volume estimate for Year 1 (2027) — pilot-stage,
+     not the old 200->3,000/month curve.
+  2. What Shifa actually earns from the transaction fee, and how that's
+     split with Absa (Absa fronts the capital and carries credit risk —
+     that's a bank's job, not a startup's — so Shifa's own P&L only
+     carries its own platform costs).
+  3. How much startup capital Shifa needs to implement and run this
+     until its own P&L breaks even — separate from the capital Absa
+     deploys to fund invoices, which is Absa's balance sheet, not Shifa's.
 """
 
 import streamlit as st
@@ -19,452 +20,218 @@ import matplotlib.pyplot as plt
 import warnings
 warnings.filterwarnings('ignore')
 
-# Page config
-st.set_page_config(
-    page_title="Shifa — Cost & Revenue",
-    page_icon="📊",
-    layout="wide"
-)
+st.set_page_config(page_title="Shifa — 2027 Ramp & Capital Ask", page_icon="🚀", layout="wide")
 
-# Custom CSS
 st.markdown("""
 <style>
-    .main-header {
-        font-size: 2rem;
-        font-weight: 700;
-        color: #1a3a5c;
-        text-align: center;
-        padding: 1rem 0;
-    }
-    .sub-header {
-        font-size: 1rem;
-        font-weight: 400;
-        color: #4a6a8a;
-        text-align: center;
-        padding-bottom: 1rem;
-    }
-    .section-header {
-        font-size: 1.1rem;
-        font-weight: 700;
-        color: #1a3a5c;
-        padding-top: 0.5rem;
-    }
-    .metric-card {
-        background-color: #f8f9fa;
-        border-radius: 8px;
-        padding: 1rem;
-        border-left: 4px solid #2E86C1;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
-    }
-    .risk-card {
-        background-color: #fff8f5;
-        border-radius: 8px;
-        padding: 1rem;
-        border-left: 4px solid #E4002B;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
-    }
-    .metric-value {
-        font-size: 1.8rem;
-        font-weight: 700;
-        color: #1a3a5c;
-    }
-    .risk-value {
-        font-size: 1.8rem;
-        font-weight: 700;
-        color: #9C0018;
-    }
-    .metric-label {
-        font-size: 0.8rem;
-        color: #6c757d;
-    }
-    .positive { color: #28a745; }
-    .negative { color: #dc3545; }
-    .neutral { color: #6c757d; }
+    .main-header { font-size: 2rem; font-weight: 700; color: #1a3a5c; text-align: center; padding: 1rem 0; }
+    .sub-header { font-size: 1rem; font-weight: 400; color: #4a6a8a; text-align: center; padding-bottom: 1rem; }
+    .metric-card { background-color: #f8f9fa; border-radius: 8px; padding: 1rem; border-left: 4px solid #2E86C1; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+    .ask-card { background-color: #fff8f5; border-radius: 8px; padding: 1rem; border-left: 4px solid #E4002B; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+    .metric-value { font-size: 1.8rem; font-weight: 700; color: #1a3a5c; }
+    .ask-value { font-size: 1.8rem; font-weight: 700; color: #9C0018; }
+    .metric-label { font-size: 0.8rem; color: #6c757d; }
 </style>
 """, unsafe_allow_html=True)
 
-# ============================================================================
-# DATA GENERATION
-# ============================================================================
 
 @st.cache_data
-def generate_financial_data(cost_of_funds_annual, credit_loss_rate, days_outstanding,
-                             manual_review_share, cost_per_review):
-    """Generate Year 1 cost and revenue projections, including the cost of
-    the capital advanced against invoices and a credit-loss provision —
-    the two line items that actually dominate an invoice-financing
-    business's cost base, alongside a manual-review cost for invoices
-    routed to the credit desk (see the >R100k admin-review threshold)."""
+def generate_2027_model(shifa_fee_share, aws_per_invoice, manual_review_share, cost_per_review,
+                         team_start, team_end, absa_start_share, absa_end_share):
+    months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    idx = np.arange(12)
 
-    months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-              'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-    months_idx = np.arange(len(months))
+    # --- Conservative pilot-stage volume ramp ---
+    # Starts at real pilot scale, not an established platform's volume.
+    invoices = np.round(15 + (330 - 15) / (1 + np.exp(-0.55 * (idx - 6.5)))).astype(int)
+    avg_value = np.round(150000 + (230000 - 150000) / (1 + np.exp(-0.4 * (idx - 5))), -3)
+    absa_share = absa_start_share + (absa_end_share - absa_start_share) / (1 + np.exp(-0.4 * (idx - 6)))
 
-    # Invoices per month (growing from 200 to 3,000 as distribution matures)
-    invoices_per_month = np.round(200 + (3000 - 200) / (1 + np.exp(-0.6 * (months_idx - 6)))).astype(int)
+    total_value = invoices * avg_value
+    absa_value = total_value * absa_share
+    nonabsa_value = total_value * (1 - absa_share)
 
-    # Average invoice value: R150,000 -> R250,000
-    avg_invoice_value = np.round(150000 + 100000 / (1 + np.exp(-0.4 * (months_idx - 5))), -3)
-    total_value_per_month = invoices_per_month * avg_invoice_value
+    # --- The pool that gets split with Absa ---
+    gross_transaction_fee = absa_value * 0.015 + nonabsa_value * 0.045
+    escrow_revenue = total_value * 0.005       # Shifa's own service fee — not split
+    collections_revenue = total_value * 0.005 * 0.10  # Shifa's own service fee — not split
 
-    # Absa share of volume grows over the year — the built-in 4.5% -> 1.5%
-    # incentive converting non-Absa users, same story as the deck's funnel
-    absa_share = 0.30 + (0.55 - 0.30) / (1 + np.exp(-0.5 * (months_idx - 6)))
-    absa_value = total_value_per_month * absa_share
-    nonabsa_value = total_value_per_month * (1 - absa_share)
+    shifa_fee_revenue = gross_transaction_fee * shifa_fee_share
+    absa_fee_revenue = gross_transaction_fee * (1 - shifa_fee_share)
+    shifa_revenue = shifa_fee_revenue + escrow_revenue + collections_revenue
 
-    # --- REVENUE ---
-    # Transaction fee: 1.5% on the Absa-customer share, 4.5% on the rest —
-    # split by actual segment value, not stacked on the full total (v1 bug)
-    fee_revenue = absa_value * 0.015 + nonabsa_value * 0.045
-    escrow_revenue = total_value_per_month * 0.005          # 0.5% escrow fee on all value
-    collections_revenue = total_value_per_month * 0.005 * 0.10  # 0.5% on the 10% needing collections
-    total_revenue = fee_revenue + escrow_revenue + collections_revenue
-
-    # --- CAPITAL DEPLOYED ---
-    # Blended advance rate: 85% for Absa customers, 65% for non-Absa
+    # --- Absa's side (capital deployed, for context only — not Shifa's ask) ---
     advance_rate = absa_share * 0.85 + (1 - absa_share) * 0.65
-    advances = total_value_per_month * advance_rate  # actual cash paid out to SMEs
+    absa_advances = total_value * advance_rate
 
-    # --- OPERATING COSTS ---
-    aws_lambda = 2000 + (invoices_per_month * 0.15)
-    aws_textract = invoices_per_month * 0.30
-    aws_bedrock = invoices_per_month * 0.20
-    aws_storage = 500 + (invoices_per_month * 0.01)
-    aws_total = aws_lambda + aws_textract + aws_bedrock + aws_storage
-    multi_cloud = aws_total * 0.10  # redundancy premium
-    infra_costs = aws_total + multi_cloud
+    # --- Shifa's OWN operating costs (grounded in sourced AWS pricing) ---
+    aws_cost = invoices * aws_per_invoice
+    credit_desk_cost = invoices * manual_review_share * cost_per_review
+    team_cost = np.round(np.linspace(team_start, team_end, 12), -3)
+    marketing = 8000 + invoices * 15
+    compliance = np.full(12, 10000.0)
 
-    dev_costs = np.full(len(months), 25000.0)
-    marketing = 5000 + (invoices_per_month * 0.50)
-    compliance = np.full(len(months), 3000.0)
-
-    # Credit-desk review cost: invoices above the R100k threshold route to
-    # a human — modeled here as a fixed share of volume (see pitch: roughly
-    # 60% of a typical invoice book sits above R100k) at a modest per-review cost
-    credit_desk_costs = invoices_per_month * manual_review_share * cost_per_review
-
-    # --- COST OF CAPITAL & CREDIT RISK (previously missing entirely) ---
-    # Outstanding book approximates using average days-to-repayment; advances
-    # aren't repaid within the same month they're made, so the funded book
-    # runs larger than a single month's advance volume
-    outstanding_book = advances * (days_outstanding / 30.0)
-    cost_of_capital = outstanding_book * (cost_of_funds_annual / 100.0) / 12.0
-    credit_loss_provision = advances * (credit_loss_rate / 100.0)
-
-    total_costs = (infra_costs + dev_costs + marketing + compliance
-                   + credit_desk_costs + cost_of_capital + credit_loss_provision)
-
-    profit = total_revenue - total_costs
-    profit_margin = (profit / total_revenue) * 100
+    shifa_cost = aws_cost + credit_desk_cost + team_cost + marketing + compliance
+    shifa_profit = shifa_revenue - shifa_cost
+    cumulative = np.cumsum(shifa_profit)
 
     return pd.DataFrame({
-        'Month': months,
-        'Invoices': invoices_per_month,
-        'Invoice_Value': avg_invoice_value,
-        'Total_Value': total_value_per_month,
-        'Advances': advances,
-        'Fee_Revenue': fee_revenue,
-        'Escrow_Revenue': escrow_revenue,
-        'Collections_Revenue': collections_revenue,
-        'Total_Revenue': total_revenue,
-        'Infra_Costs': infra_costs,
-        'Dev_Costs': dev_costs,
-        'Marketing_Costs': marketing,
-        'Compliance_Costs': compliance,
-        'CreditDesk_Costs': credit_desk_costs,
-        'CostOfCapital': cost_of_capital,
-        'CreditLoss': credit_loss_provision,
-        'Total_Costs': total_costs,
-        'Profit': profit,
-        'Profit_Margin': profit_margin
+        'Month': months, 'Invoices': invoices, 'Avg_Value': avg_value, 'Absa_Share_Pct': absa_share * 100,
+        'Total_Value': total_value, 'Gross_Transaction_Fee': gross_transaction_fee,
+        'Shifa_Fee_Revenue': shifa_fee_revenue, 'Absa_Fee_Revenue': absa_fee_revenue,
+        'Escrow_Revenue': escrow_revenue, 'Collections_Revenue': collections_revenue,
+        'Shifa_Revenue': shifa_revenue, 'AWS_Cost': aws_cost, 'CreditDesk_Cost': credit_desk_cost,
+        'Team_Cost': team_cost, 'Marketing_Cost': marketing, 'Compliance_Cost': compliance,
+        'Shifa_Cost': shifa_cost, 'Shifa_Profit': shifa_profit, 'Cumulative': cumulative,
+        'Absa_Advances': absa_advances,
     })
 
-# ============================================================================
-# DASHBOARD
-# ============================================================================
 
 def main():
+    st.markdown('<p class="main-header">Shifa — 2027 Ramp, Fee Split &amp; Startup Capital</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sub-header">Realistic Year 1 volume · What Shifa keeps vs. Absa · What we actually need to raise</p>', unsafe_allow_html=True)
 
-    # Header
-    st.markdown('<p class="main-header">Shifa — Cost & Revenue Dashboard</p>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-header">Year 1 Projections · Invoice-to-Cash Marketplace</p>', unsafe_allow_html=True)
+    st.sidebar.header("Assumptions")
+    st.sidebar.caption("Nothing here is fact — these are the levers a real negotiation with Absa and a real cost quote would settle. Move them to stress-test.")
 
-    # =========================================================================
-    # ASSUMPTIONS (sidebar) — stress-test the model live
-    # =========================================================================
-    st.sidebar.header("Model Assumptions")
-    st.sidebar.caption("These four inputs drive the cost of capital and credit-risk lines below. Move them to stress-test the model live.")
-
-    cost_of_funds = st.sidebar.slider("Cost of funds (annual %)", 6.0, 18.0, 11.0, 0.5,
-                                       help="Blended annual rate to fund advances — proxy for a bank funding line off SA prime.")
-    credit_loss_rate = st.sidebar.slider("Credit loss rate (% of advances)", 0.0, 4.0, 1.2, 0.1,
-                                          help="Expected bad-debt rate on advanced capital — typical trade-receivable factoring range is roughly 0.5–2%.")
-    days_outstanding = st.sidebar.slider("Average days to repayment", 15, 90, 45, 5,
-                                          help="How long advanced capital sits on the book before the buyer settles.")
-    manual_review_share = st.sidebar.slider("Share of invoices routed to credit desk (%)", 0, 100, 60, 5,
-                                             help="Invoices above the R100k threshold get a human reviewer — see the admin-side threshold.") / 100.0
+    shifa_fee_share = st.sidebar.slider("Shifa's share of the transaction fee (%)", 10, 60, 35, 5,
+                                         help="Absa keeps the rest — they're funding the advances and carrying credit risk, which is why they keep the larger share.") / 100.0
+    absa_start = st.sidebar.slider("Absa customer share — January (%)", 10, 50, 25, 5) / 100.0
+    absa_end = st.sidebar.slider("Absa customer share — December (%)", 30, 80, 50, 5) / 100.0
+    aws_per_invoice = st.sidebar.slider("AWS infra cost per invoice (R)", 0.5, 3.0, 0.96, 0.05,
+                                         help="Sourced bottom-up from AWS's published af-south-1 pricing — Textract Forms extraction is ~99% of this line.")
+    manual_review_share = st.sidebar.slider("Share of invoices routed to credit desk (%)", 0, 100, 60, 5) / 100.0
     cost_per_review = st.sidebar.slider("Cost per manual review (R)", 50, 500, 180, 10)
+    team_start = st.sidebar.slider("Team cost — January (R/month)", 20000, 150000, 60000, 5000,
+                                    help="Placeholder for founder/contractor cost — replace with real numbers.")
+    team_end = st.sidebar.slider("Team cost — December (R/month)", 60000, 300000, 120000, 5000)
 
-    data = generate_financial_data(cost_of_funds, credit_loss_rate, days_outstanding,
-                                    manual_review_share, cost_per_review)
-    latest = data.iloc[-1]
-    total_annual = data.sum(numeric_only=True)
-    blended_margin = (total_annual['Profit'] / total_annual['Total_Revenue']) * 100
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("One-Time Implementation Costs")
+    sec_cost = st.sidebar.number_input("Security hardening & pen test (R)", value=80000, step=5000)
+    legal_cost = st.sidebar.number_input("Legal & compliance setup (R)", value=60000, step=5000)
+    integration_cost = st.sidebar.number_input("Absa API integration & UAT (R)", value=50000, step=5000)
+    prelaunch_cost = st.sidebar.number_input("Pre-launch team runway (R)", value=100000, step=5000)
+    buffer_months = st.sidebar.slider("Safety-buffer months (beyond breakeven math)", 0, 12, 4, 1,
+                                       help="No credible team budgets to the exact rand the model predicts — this covers slower-than-modeled adoption.")
+
+    data = generate_2027_model(shifa_fee_share, aws_per_invoice, manual_review_share, cost_per_review,
+                                team_start, team_end, absa_start, absa_end)
+
+    total_impl = sec_cost + legal_cost + integration_cost + prelaunch_cost
+    trough = data['Cumulative'].min()
+    trough_month = data.loc[data['Cumulative'].idxmin(), 'Month']
+    breakeven_rows = data[data['Cumulative'] >= 0]
+    breakeven_month = breakeven_rows.iloc[0]['Month'] if len(breakeven_rows) else "Not within 2027"
+    buffer_amount = buffer_months * data['Shifa_Cost'].iloc[0]
+    total_ask = total_impl + abs(min(trough, 0)) + buffer_amount
 
     # =========================================================================
     # KPI ROW
     # =========================================================================
-
-    col1, col2, col3, col4, col5 = st.columns(5)
-
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-value">R{total_annual['Total_Revenue']/1e6:,.1f}M</div>
-            <div class="metric-label">Annual Revenue</div>
-        </div>
-        """, unsafe_allow_html=True)
-
+        st.markdown(f"""<div class="metric-card"><div class="metric-value">{int(data['Invoices'].sum()):,}</div>
+        <div class="metric-label">Invoices, Full Year 2027</div></div>""", unsafe_allow_html=True)
     with col2:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-value">R{total_annual['Total_Costs']/1e6:,.1f}M</div>
-            <div class="metric-label">Annual Costs (incl. capital &amp; risk)</div>
-        </div>
-        """, unsafe_allow_html=True)
-
+        st.markdown(f"""<div class="metric-card"><div class="metric-value">R{data['Shifa_Revenue'].sum()/1e6:.2f}M</div>
+        <div class="metric-label">Shifa's Own Revenue (Year 1)</div></div>""", unsafe_allow_html=True)
     with col3:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-value" style="color: {'#28a745' if total_annual['Profit'] > 0 else '#dc3545'}">
-                R{total_annual['Profit']/1e6:,.1f}M
-            </div>
-            <div class="metric-label">Annual Profit</div>
-        </div>
-        """, unsafe_allow_html=True)
-
+        st.markdown(f"""<div class="metric-card"><div class="metric-value">{breakeven_month}</div>
+        <div class="metric-label">Shifa P&amp;L Breakeven Month</div></div>""", unsafe_allow_html=True)
     with col4:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-value" style="color: {'#28a745' if blended_margin > 10 else '#6c757d'}">
-                {blended_margin:.1f}%
-            </div>
-            <div class="metric-label">Blended Profit Margin</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with col5:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-value">{int(total_annual['Invoices']):,}</div>
-            <div class="metric-label">Annual Invoices</div>
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown(f"""<div class="metric-card"><div class="metric-value">R{trough:,.0f}</div>
+        <div class="metric-label">Peak Cash Gap (Month: {trough_month})</div></div>""", unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
 
     # =========================================================================
-    # CAPITAL & RISK ROW — the two lines the old model omitted
+    # STARTUP CAPITAL ASK
     # =========================================================================
-    st.markdown('<p class="section-header">Capital &amp; Credit Risk</p>', unsafe_allow_html=True)
-    rcol1, rcol2, rcol3 = st.columns(3)
+    st.markdown("### What We Actually Need to Raise")
+    acol1, acol2, acol3, acol4 = st.columns(4)
+    with acol1:
+        st.markdown(f"""<div class="ask-card"><div class="ask-value">R{total_impl:,.0f}</div>
+        <div class="metric-label">One-Time Implementation</div></div>""", unsafe_allow_html=True)
+    with acol2:
+        st.markdown(f"""<div class="ask-card"><div class="ask-value">R{abs(min(trough,0)):,.0f}</div>
+        <div class="metric-label">P&amp;L Funding Gap to Breakeven</div></div>""", unsafe_allow_html=True)
+    with acol3:
+        st.markdown(f"""<div class="ask-card"><div class="ask-value">R{buffer_amount:,.0f}</div>
+        <div class="metric-label">{buffer_months}-Month Safety Buffer</div></div>""", unsafe_allow_html=True)
+    with acol4:
+        st.markdown(f"""<div class="ask-card" style="border-left-color:#1a3a5c;"><div class="metric-value">R{total_ask:,.0f}</div>
+        <div class="metric-label">Total Recommended Raise</div></div>""", unsafe_allow_html=True)
 
-    with rcol1:
-        st.markdown(f"""
-        <div class="risk-card">
-            <div class="risk-value">R{total_annual['Advances']/1e6:,.1f}M</div>
-            <div class="metric-label">Capital Advanced to SMEs (Year 1)</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with rcol2:
-        st.markdown(f"""
-        <div class="risk-card">
-            <div class="risk-value">R{total_annual['CostOfCapital']/1e6:,.1f}M</div>
-            <div class="metric-label">Cost of Capital ({cost_of_funds:.1f}%/yr funding rate)</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with rcol3:
-        st.markdown(f"""
-        <div class="risk-card">
-            <div class="risk-value">R{total_annual['CreditLoss']/1e6:,.1f}M</div>
-            <div class="metric-label">Credit-Loss Provision ({credit_loss_rate:.1f}% of advances)</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    st.caption("These two lines are why margin looks materially different from a pure SaaS or software fee business — Shifa is deploying capital, not just moving data.")
+    st.caption("This is Shifa's own ask — covering platform build-out and operating burn. It does NOT include the capital Absa deploys to fund invoice advances; that's Absa's balance sheet and credit risk, the same as any bank funding a lending product.")
+    st.caption("Absa's advances for context, not part of Shifa's ask: " + f"R{data['Absa_Advances'].sum()/1e6:,.1f}M deployed across 2027, generating Absa R{data['Absa_Fee_Revenue'].sum()/1e6:,.2f}M in fee revenue.")
 
     st.markdown("---")
 
     # =========================================================================
-    # CHART 1: Revenue vs Costs (Monthly)
+    # THE DOUBLE BAR CHART — Cost vs. Revenue ("profit"), month by month
     # =========================================================================
+    st.subheader("Monthly Cost vs. Revenue — 2027")
+    st.caption("Two bars per month: what it costs Shifa to run the platform that month, and what Shifa earns from its share of the fee plus its own service fees. Early months, cost sits above revenue — that gap is the funding ask. From the breakeven month on, revenue overtakes cost.")
 
-    col1, col2 = st.columns([2, 1])
+    fig, ax = plt.subplots(figsize=(11, 5))
+    x = np.arange(len(data))
+    width = 0.38
 
-    with col1:
-        st.subheader("Revenue & Costs")
+    bars_cost = ax.bar(x - width/2, data['Shifa_Cost'], width, label='Cost', color='#E74C3C')
+    bars_rev = ax.bar(x + width/2, data['Shifa_Revenue'], width, label='Revenue ("Profit" line)', color='#2E86C1')
 
-        fig, ax = plt.subplots(figsize=(10, 4))
+    ax.set_xticks(x)
+    ax.set_xticklabels(data['Month'])
+    ax.set_ylabel('R')
+    ax.set_title("Shifa's Own Monthly Cost vs. Revenue — 2027")
+    ax.legend(loc='upper left')
+    ax.grid(True, alpha=0.3, axis='y')
 
-        ax.plot(data['Month'], data['Total_Revenue']/1000,
-                marker='o', linewidth=2.5, color='#2E86C1', label='Revenue')
-        ax.plot(data['Month'], data['Total_Costs']/1000,
-                marker='s', linewidth=2.5, color='#E74C3C', label='Costs')
-        ax.fill_between(data['Month'], data['Total_Revenue']/1000,
-                        data['Total_Costs']/1000,
-                        where=(data['Total_Revenue'] > data['Total_Costs']),
-                        color='#28a745', alpha=0.15, label='Profit Zone')
-        ax.fill_between(data['Month'], data['Total_Revenue']/1000,
-                        data['Total_Costs']/1000,
-                        where=(data['Total_Revenue'] < data['Total_Costs']),
-                        color='#dc3545', alpha=0.15, label='Loss Zone')
+    # Mark the breakeven month
+    if len(breakeven_rows):
+        be_idx = data[data['Month'] == breakeven_month].index[0]
+        ax.axvline(be_idx - 0.5, color='#28a745', linestyle='--', linewidth=1.5)
+        ax.text(be_idx - 0.45, ax.get_ylim()[1]*0.95, 'Breakeven', color='#28a745', fontsize=9, fontweight='bold')
 
-        ax.set_xlabel('2026')
-        ax.set_ylabel('R Thousands')
-        ax.legend(loc='upper left')
-        ax.grid(True, alpha=0.3)
+    st.pyplot(fig)
 
-        st.pyplot(fig)
+    st.caption("Net monthly profit/loss (Revenue − Cost) and cumulative position, for reference:")
+    profit_table = pd.DataFrame({
+        'Month': data['Month'],
+        'Invoices': data['Invoices'],
+        'Cost (R)': data['Shifa_Cost'].apply(lambda x: f"R{x:,.0f}"),
+        'Revenue (R)': data['Shifa_Revenue'].apply(lambda x: f"R{x:,.0f}"),
+        'Net (R)': data['Shifa_Profit'].apply(lambda x: f"R{x:,.0f}"),
+        'Cumulative (R)': data['Cumulative'].apply(lambda x: f"R{x:,.0f}"),
+    })
+    st.dataframe(profit_table, use_container_width=True, hide_index=True)
 
-    with col2:
-        st.subheader("Revenue Sources")
-
-        fig2, ax2 = plt.subplots(figsize=(5, 4))
-
-        revenue_sources = [
-            total_annual['Fee_Revenue'],
-            total_annual['Escrow_Revenue'],
-            total_annual['Collections_Revenue']
-        ]
-        labels = ['Transaction Fees', 'Escrow Fees', 'Collections']
-        colors = ['#2E86C1', '#28a745', '#8E44AD']
-
-        ax2.pie(revenue_sources, labels=labels, autopct='%1.0f%%', colors=colors, startangle=90)
-        ax2.axis('equal')
-
-        st.pyplot(fig2)
+    st.markdown("---")
 
     # =========================================================================
-    # CHART 2: Cost Breakdown
+    # FEE SPLIT DETAIL
     # =========================================================================
-
+    st.subheader("Where the Fee Actually Goes")
     col1, col2 = st.columns([1, 1])
-
     with col1:
-        st.subheader("Cost Breakdown")
-
-        fig3, ax3 = plt.subplots(figsize=(8, 4.2))
-
-        cost_categories = [
-            total_annual['Infra_Costs'],
-            total_annual['Dev_Costs'],
-            total_annual['Marketing_Costs'],
-            total_annual['Compliance_Costs'],
-            total_annual['CreditDesk_Costs'],
-            total_annual['CostOfCapital'],
-            total_annual['CreditLoss'],
-        ]
-        cost_labels = ['Infra', 'Dev', 'Marketing', 'Compliance', 'Credit Desk', 'Cost of\nCapital', 'Credit\nLoss']
-        colors = ['#3498db', '#2ecc71', '#f39c12', '#95a5a6', '#8E44AD', '#E4002B', '#9C0018']
-
-        bars = ax3.bar(cost_labels, [c/1000 for c in cost_categories], color=colors)
-        ax3.set_ylabel('R Thousands')
-        ax3.set_title('Annual Cost Breakdown')
-        ax3.tick_params(axis='x', rotation=0, labelsize=8)
-
-        for bar, val in zip(bars, [c/1000 for c in cost_categories]):
-            ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(cost_categories)/1000*0.02,
-                    f'R{val:,.0f}K', ha='center', va='bottom', fontsize=7.5)
-
-        st.pyplot(fig3)
-
+        fig2, ax2 = plt.subplots(figsize=(5, 4))
+        totals = [data['Shifa_Fee_Revenue'].sum(), data['Absa_Fee_Revenue'].sum()]
+        ax2.pie(totals, labels=[f'Shifa ({shifa_fee_share*100:.0f}%)', f'Absa ({(1-shifa_fee_share)*100:.0f}%)'],
+                autopct=lambda p: f'R{p/100*sum(totals)/1e6:.1f}M', colors=['#2E86C1', '#E4002B'], startangle=90)
+        ax2.set_title('Annual Transaction-Fee Split')
+        st.pyplot(fig2)
     with col2:
-        st.subheader("Monthly Profit Trend")
+        st.markdown("""
+        **Why the split looks like this:**
+        - **Absa** fronts the advance to the SME, carries the funding cost and the credit risk if the buyer doesn't pay — the same role a bank plays in any factoring product. That's why it keeps the larger share.
+        - **Shifa** carries the platform: extraction, verification, the trust-scoring integration, and the credit-desk workflow for invoices above R100k. Shifa's share is sized to cover that operating cost, not to compete with a bank's margin on deployed capital.
+        - **Escrow and collections fees stay with Shifa entirely** — those are platform services, not capital-risk compensation, so they aren't part of the negotiated split.
+        """)
 
-        fig4, ax4 = plt.subplots(figsize=(8, 4.2))
+    with st.expander("View Full Monthly Detail"):
+        st.dataframe(data.round(0), use_container_width=True)
 
-        colors_profit = ['#28a745' if p > 0 else '#dc3545' for p in data['Profit']]
-        ax4.bar(data['Month'], data['Profit']/1000, color=colors_profit, alpha=0.7)
-        ax4.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
-        ax4.set_xlabel('2026')
-        ax4.set_ylabel('R Thousands')
-        ax4.set_title('Monthly Profit / Loss (After Capital & Credit-Loss Costs)')
-        ax4.grid(True, alpha=0.3, axis='y')
-
-        st.pyplot(fig4)
-
-    # =========================================================================
-    # CHART 3: Unit Economics
-    # =========================================================================
-
-    st.subheader("Unit Economics Per Invoice")
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    avg_revenue_per_invoice = total_annual['Total_Revenue'] / total_annual['Invoices']
-    avg_cost_per_invoice = total_annual['Total_Costs'] / total_annual['Invoices']
-    avg_profit_per_invoice = avg_revenue_per_invoice - avg_cost_per_invoice
-
-    with col1:
-        st.metric("Revenue / Invoice", f"R{avg_revenue_per_invoice:,.0f}")
-
-    with col2:
-        st.metric("Cost / Invoice", f"R{avg_cost_per_invoice:,.0f}")
-
-    with col3:
-        st.metric("Profit / Invoice", f"R{avg_profit_per_invoice:,.0f}")
-
-    with col4:
-        # Break-even volume: fixed costs vs. the *same month's* contribution
-        # margin per invoice — not the old bug of mixing one month's fixed
-        # cost against the full-year average revenue-per-invoice
-        fixed_costs_latest = (latest['Dev_Costs'] + latest['Compliance_Costs']
-                               + 2000 + 500 + 5000)  # fixed floors inside Infra/Marketing
-        revenue_per_invoice_latest = latest['Total_Revenue'] / latest['Invoices']
-        variable_cost_per_invoice_latest = (latest['Total_Costs'] - fixed_costs_latest) / latest['Invoices']
-        contribution_margin = revenue_per_invoice_latest - variable_cost_per_invoice_latest
-        break_even_volume = fixed_costs_latest / contribution_margin if contribution_margin > 0 else float('nan')
-        st.metric("Break-Even Volume (Dec economics)", f"{break_even_volume:,.0f} / month")
-
-    st.caption("Break-even is calculated on December's own fixed vs. variable cost split — not blended against the full-year average, which understates how quickly the model actually breaks even.")
-
-    # =========================================================================
-    # COST STRUCTURE TABLE
-    # =========================================================================
-
-    with st.expander("View Detailed Cost & Revenue Table"):
-
-        st.subheader("Revenue & Capital Breakdown")
-        revenue_table = pd.DataFrame({
-            'Month': data['Month'],
-            'Invoices': data['Invoices'],
-            'Advances Paid Out (R)': data['Advances'].apply(lambda x: f"R{x:,.0f}"),
-            'Transaction Fees (R)': data['Fee_Revenue'].apply(lambda x: f"R{x:,.0f}"),
-            'Escrow Fees (R)': data['Escrow_Revenue'].apply(lambda x: f"R{x:,.0f}"),
-            'Collections (R)': data['Collections_Revenue'].apply(lambda x: f"R{x:,.0f}"),
-            'Total Revenue (R)': data['Total_Revenue'].apply(lambda x: f"R{x:,.0f}"),
-            'Profit (R)': data['Profit'].apply(lambda x: f"R{x:,.0f}"),
-            'Margin %': data['Profit_Margin'].apply(lambda x: f"{x:.1f}%")
-        })
-        st.dataframe(revenue_table, use_container_width=True)
-
-        st.subheader("Cost Breakdown")
-        cost_table = pd.DataFrame({
-            'Month': data['Month'],
-            'Invoices': data['Invoices'],
-            'Infra (R)': data['Infra_Costs'].apply(lambda x: f"R{x:,.0f}"),
-            'Development (R)': data['Dev_Costs'].apply(lambda x: f"R{x:,.0f}"),
-            'Marketing (R)': data['Marketing_Costs'].apply(lambda x: f"R{x:,.0f}"),
-            'Compliance (R)': data['Compliance_Costs'].apply(lambda x: f"R{x:,.0f}"),
-            'Credit Desk (R)': data['CreditDesk_Costs'].apply(lambda x: f"R{x:,.0f}"),
-            'Cost of Capital (R)': data['CostOfCapital'].apply(lambda x: f"R{x:,.0f}"),
-            'Credit Loss (R)': data['CreditLoss'].apply(lambda x: f"R{x:,.0f}"),
-            'Total Costs (R)': data['Total_Costs'].apply(lambda x: f"R{x:,.0f}")
-        })
-        st.dataframe(cost_table, use_container_width=True)
 
 if __name__ == "__main__":
     main()
